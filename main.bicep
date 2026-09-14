@@ -90,6 +90,11 @@ param bootDiagnostics bool = true
 @description('Optional. Windows guest OS time zone applied by the init script, e.g. "Pacific Standard Time".')
 param timeZoneId string = 'UTC'
 
+@description('''Optional. If true, the first-boot script installs the On-premises Data Gateway (standard/"enterprise" mode) software via scripts/install-data-gateway.ps1.
+This only installs the software - it does NOT register/join a gateway cluster, because Microsoft's own cmdlet docs require an interactive ("user based") sign-in for that step, which cannot run unattended as SYSTEM during provisioning.
+After the VM is up, an admin must RDP/console in and run scripts/register-data-gateway.ps1 manually to finish setup. Requires outbound internet access from the VM (PowerShell Gallery, GitHub, Microsoft download endpoints).''')
+param installDataGateway bool = false
+
 @description('Optional. Tags applied to all resources.')
 param tags object = {
   environment: 'dev'
@@ -102,10 +107,31 @@ param tags object = {
 
 // The Windows equivalent of a cloud-init script, run once on first boot via the
 // AVM module's built-in CustomScriptExtension support. Loaded from disk so the
-// script can be authored/tested as a normal .ps1 file. The timezone placeholder is
-// substituted here at compile time so no arguments need to be passed on the command
-// line (which keeps the extension's commandToExecute free of nested-quoting issues).
-var initScriptContent = replace(loadTextContent('scripts/init.ps1'), '__TIME_ZONE_ID__', timeZoneId)
+// script can be authored/tested as a normal .ps1 file. Placeholders are substituted
+// here at compile time so no arguments need to be passed on the command line (which
+// keeps the extension's commandToExecute free of nested-quoting issues).
+//
+// install-data-gateway.ps1 and register-data-gateway.ps1 are themselves embedded as
+// base64 blobs and spliced into init.ps1, which writes them to disk on the VM and runs
+// the "install" one immediately - see scripts/init.ps1 for why registration is not
+// automated the same way.
+var initScriptContentRaw = loadTextContent('scripts/init.ps1')
+var initScriptContentWithTimeZone = replace(initScriptContentRaw, '__TIME_ZONE_ID__', timeZoneId)
+var initScriptContentWithGatewayFlag = replace(
+  initScriptContentWithTimeZone,
+  '__INSTALL_DATA_GATEWAY__',
+  installDataGateway ? 'true' : 'false'
+)
+var initScriptContentWithInstallScript = replace(
+  initScriptContentWithGatewayFlag,
+  '__GATEWAY_INSTALL_SCRIPT_B64__',
+  base64(loadTextContent('scripts/install-data-gateway.ps1'))
+)
+var initScriptContent = replace(
+  initScriptContentWithInstallScript,
+  '__GATEWAY_REGISTER_SCRIPT_B64__',
+  base64(loadTextContent('scripts/register-data-gateway.ps1'))
+)
 
 // PowerShell has no native way to decode a UTF-8 base64 payload via -EncodedCommand
 // (that flag requires UTF-16LE), so the script is base64-encoded with Bicep's UTF-8

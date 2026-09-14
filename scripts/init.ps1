@@ -18,9 +18,15 @@
 
 [CmdletBinding()]
 param(
-    # Substituted at Bicep compile-time by main.bicep (see `replace()` on initScriptContent)
-    [string]$TimeZoneId = '__TIME_ZONE_ID__',
-    [string]$LogPath    = 'C:\Windows\Temp\init-script.log'
+    # All of the following are substituted at Bicep compile-time by main.bicep
+    # (see the `replace()` calls building initScriptContent) - do not rename the
+    # __PLACEHOLDER__ tokens without updating main.bicep to match.
+    [string]$TimeZoneId         = '__TIME_ZONE_ID__',
+    [string]$InstallDataGateway = '__INSTALL_DATA_GATEWAY__',   # 'true' or 'false'
+    [string]$GatewayInstallScriptB64   = '__GATEWAY_INSTALL_SCRIPT_B64__',
+    [string]$GatewayRegisterScriptB64  = '__GATEWAY_REGISTER_SCRIPT_B64__',
+    [string]$LogPath            = 'C:\Windows\Temp\init-script.log',
+    [string]$GatewayScriptDir   = 'C:\ProgramData\vm-init'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -69,6 +75,71 @@ try {
         Initialize-Disk -Number $disk.Number -PartitionStyle GPT -PassThru |
             New-Partition -AssignDriveLetter -UseMaximumSize |
             Format-Volume -FileSystem NTFS -NewFileSystemLabel "Data$($disk.Number)" -Confirm:$false
+    }
+
+    # ---------------------------------------------------------------------
+    # On-premises Data Gateway (standard/"enterprise" mode) - unattended install only.
+    #
+    # This installs the gateway SOFTWARE. It deliberately does NOT create/register the
+    # gateway cluster: Microsoft's own docs state Add-DataGatewayCluster and
+    # Add-DataGatewayClusterMember "must be run with a user based credential" (an
+    # interactive sign-in), which cannot run headless as SYSTEM during provisioning.
+    # An admin must finish setup by running register-data-gateway.ps1 manually.
+    # ---------------------------------------------------------------------
+    if ($InstallDataGateway -eq 'true') {
+        Write-Log 'InstallDataGateway=true - installing the on-premises data gateway'
+
+        New-Item -Path $GatewayScriptDir -ItemType Directory -Force | Out-Null
+
+        # PowerShell 7+ is required by the DataGateway module (Windows PowerShell 5.1,
+        # which is what this init script itself runs under, is not supported).
+        if (-not (Get-Command pwsh.exe -ErrorAction SilentlyContinue)) {
+            Write-Log 'PowerShell 7 not found - installing it silently via the latest GitHub MSI release'
+            $release = Invoke-RestMethod -UseBasicParsing -Uri 'https://api.github.com/repos/PowerShell/PowerShell/releases/latest'
+            $asset = $release.assets | Where-Object { $_.name -like '*win-x64.msi' } | Select-Object -First 1
+            if (-not $asset) { throw 'Could not find a win-x64.msi asset in the latest PowerShell GitHub release.' }
+
+            $msiPath = Join-Path $env:TEMP $asset.name
+            Write-Log "Downloading PowerShell 7 installer: $($asset.browser_download_url)"
+            Invoke-WebRequest -UseBasicParsing -Uri $asset.browser_download_url -OutFile $msiPath
+
+            Write-Log 'Installing PowerShell 7 silently (msiexec /quiet)'
+            $msiArgs = @('/package', $msiPath, '/quiet', 'ADD_PATH=1')
+            $proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList $msiArgs -Wait -PassThru
+            if ($proc.ExitCode -ne 0) { throw "PowerShell 7 MSI install failed with exit code $($proc.ExitCode)" }
+
+            # Refresh PATH in this process so pwsh.exe is resolvable without a new shell
+            $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
+                        [System.Environment]::GetEnvironmentVariable('Path', 'User')
+        }
+        else {
+            Write-Log 'PowerShell 7 already present'
+        }
+
+        # Materialize the two gateway scripts on disk: install-data-gateway.ps1 is run now
+        # (unattended); register-data-gateway.ps1 is left behind for an admin to run later.
+        $installScriptPath = Join-Path $GatewayScriptDir 'install-data-gateway.ps1'
+        $registerScriptPath = Join-Path $GatewayScriptDir 'register-data-gateway.ps1'
+
+        [System.IO.File]::WriteAllText(
+            $installScriptPath,
+            [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($GatewayInstallScriptB64))
+        )
+        [System.IO.File]::WriteAllText(
+            $registerScriptPath,
+            [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($GatewayRegisterScriptB64))
+        )
+
+        Write-Log "Running $installScriptPath under pwsh.exe"
+        & pwsh.exe -NoProfile -ExecutionPolicy Bypass -File $installScriptPath
+        if ($LASTEXITCODE -ne 0) { throw "install-data-gateway.ps1 failed with exit code $LASTEXITCODE" }
+
+        Write-Log "Gateway software installed. ACTION REQUIRED: an admin must sign in to this VM (RDP/console) and run:"
+        Write-Log "  pwsh -File `"$registerScriptPath`" -GatewayName '<unique-name>'"
+        Write-Log 'to interactively register the gateway - this step cannot be automated.'
+    }
+    else {
+        Write-Log 'InstallDataGateway=false - skipping on-premises data gateway install'
     }
 
     # ---------------------------------------------------------------------

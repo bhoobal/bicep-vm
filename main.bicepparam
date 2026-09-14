@@ -22,6 +22,12 @@ param adminPassword = ''
 
 param timeZoneId = 'UTC'
 
+// Set to true to have the first-boot script install the on-premises data gateway
+// SOFTWARE (unattended). You must still RDP in afterwards and run
+// scripts/register-data-gateway.ps1 manually to register it to your tenant -
+// see the parameter description in main.bicep for why that step can't be automated.
+param installDataGateway = false
+
 param tags = {
   environment: 'dev'
   workload: 'windows-server-2025-vm'
